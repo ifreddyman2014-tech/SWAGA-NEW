@@ -311,30 +311,118 @@ async def cmd_reset_me(message: Message, session: AsyncSession):
     """
     DEBUG: Reset user's trial and subscription.
 
+    This handler:
+    1. Finds all user's subscriptions (active and inactive)
+    2. Deletes all client UUIDs from 3X-UI panels
+    3. Resets trial_used flag
+    4. Deactivates all subscriptions in database
+    5. Ensures no 'ghost' records prevent new trial activation
+
     Only for development/testing.
     """
     user = await get_or_create_user(message.from_user.id, message.from_user.username, session)
 
-    # Reset trial_used
-    user.trial_used = False
+    deleted_count = 0
+    failed_deletions = []
 
-    # Deactivate all subscriptions
-    await session.execute(
-        update(Subscription)
-        .where(Subscription.user_id == user.id)
-        .values(is_active=False)
-    )
+    try:
+        # Find ALL subscriptions for this user (not just active ones)
+        result = await session.execute(
+            select(Subscription).where(Subscription.user_id == user.id)
+        )
+        subscriptions = result.scalars().all()
 
-    await session.commit()
+        logger.info(f"Found {len(subscriptions)} subscription(s) for user {user.telegram_id}")
 
-    await message.answer(
-        "✅ <b>Сброс выполнен!</b>\n\n"
-        "• Триал сброшен\n"
-        "• Подписки деактивированы\n\n"
-        "Теперь ты можешь заново активировать пробный период.",
-        reply_markup=Keyboards.main_menu(),
-    )
-    logger.info(f"User {user.telegram_id} reset via /reset_me")
+        # For each subscription, delete all keys from 3X-UI panels
+        for subscription in subscriptions:
+            # Get all keys for this subscription
+            keys_result = await session.execute(
+                select(Key, Server)
+                .join(Server, Key.server_id == Server.id)
+                .where(Key.subscription_id == subscription.id)
+            )
+            keys_with_servers = keys_result.all()
+
+            logger.info(f"Found {len(keys_with_servers)} key(s) for subscription {subscription.id}")
+
+            # Delete each key from 3X-UI panel
+            for key, server in keys_with_servers:
+                try:
+                    # Connect to 3X-UI panel
+                    xui_client = ThreeXUIClient(
+                        base_url=server.api_url,
+                        username=server.username,
+                        password=server.password,
+                    )
+
+                    # Attempt to delete client UUID from panel
+                    success = await xui_client.delete_client(
+                        inbound_id=server.inbound_id,
+                        uuid=key.key_uuid,
+                    )
+
+                    if success:
+                        deleted_count += 1
+                        logger.info(
+                            f"Deleted client {key.key_uuid} from server {server.name} "
+                            f"(inbound {server.inbound_id})"
+                        )
+                    else:
+                        failed_deletions.append(f"{server.name} (UUID not found in panel)")
+                        logger.warning(
+                            f"Failed to delete client {key.key_uuid} from server {server.name}: "
+                            "UUID not found in panel"
+                        )
+
+                except Exception as e:
+                    failed_deletions.append(f"{server.name} ({str(e)[:50]})")
+                    logger.error(
+                        f"Error deleting client {key.key_uuid} from server {server.name}: {e}",
+                        exc_info=True,
+                    )
+
+        # Reset trial_used flag
+        user.trial_used = False
+
+        # Deactivate ALL subscriptions (prevents ghost records)
+        await session.execute(
+            update(Subscription)
+            .where(Subscription.user_id == user.id)
+            .values(is_active=False)
+        )
+
+        await session.commit()
+
+        # Build response message
+        response = "✅ <b>Сброс выполнен!</b>\n\n"
+        response += f"• Триал сброшен\n"
+        response += f"• Подписки деактивированы: {len(subscriptions)}\n"
+        response += f"• Ключи удалены с панелей: {deleted_count}\n"
+
+        if failed_deletions:
+            response += f"\n⚠️ Не удалось удалить с серверов:\n"
+            for failure in failed_deletions[:3]:  # Limit to 3 to avoid message overflow
+                response += f"  • {failure}\n"
+
+        response += "\nТеперь ты можешь заново активировать пробный период."
+
+        await message.answer(
+            response,
+            reply_markup=Keyboards.main_menu(),
+        )
+        logger.info(
+            f"User {user.telegram_id} reset via /reset_me: "
+            f"{deleted_count} keys deleted, {len(failed_deletions)} failed"
+        )
+
+    except Exception as e:
+        logger.error(f"Critical error in /reset_me for user {user.telegram_id}: {e}", exc_info=True)
+        await message.answer(
+            "❌ <b>Ошибка при сбросе!</b>\n\n"
+            "Произошла ошибка при удалении ключей. Попробуй ещё раз или обратись в поддержку.",
+            reply_markup=Keyboards.main_menu(),
+        )
 
 
 # ============== Callback Query Handlers ==============
